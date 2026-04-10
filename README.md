@@ -21,14 +21,15 @@ dags/
 The DAG runs every 5 minutes. On each run:
 
 1. **`list_pending_files`** — connects to the source SFTP, lists all files recursively, and excludes paths already recorded in the Airflow Variable manifest.
-2. **`copy_file`** *(dynamically mapped)* — one task instance per new file; streams the file in 8 MB chunks through an optional transform pipeline into the target SFTP.
+2. **`copy_file`** *(dynamically mapped)* — one task instance per new file; streams the file in 8 MB chunks through an optional transform pipeline into the target SFTP. Returns the transferred path via XCom.
+3. **`update_manifest`** — collects all transferred paths from the mapped tasks and writes them to the manifest in a single, race-free operation.
 
 ---
 
 ## Prerequisites
 
 - Docker >= 24 and Docker Compose v2
-- Ports **8080** (Airflow UI), **2222** (source SFTP), **2223** (target SFTP) free on the host
+- Ports **18080** (Airflow UI), **2222** (source SFTP), **2223** (target SFTP) free on the host
 
 ---
 
@@ -39,9 +40,9 @@ The DAG runs every 5 minutes. On each run:
 git clone <repo-url>
 cd vpb_test
 
-# 2. Create required directories and set the host UID
-mkdir -p logs
-echo "AIRFLOW_UID=$(id -u)" > .env
+# 2. Create .env from the example and set your host UID
+cp .env.example .env
+sed -i'' -e "s/^AIRFLOW_UID=.*/AIRFLOW_UID=$(id -u)/" .env
 
 # 3. Start all services (first run takes a few minutes to pull images)
 docker compose up -d
@@ -51,7 +52,7 @@ docker compose logs -f airflow-init
 # Look for: "Airflow initialisation complete."
 
 # 5. Open the Airflow UI
-open http://localhost:8080   # login: admin / admin
+open http://localhost:18080   # login: admin / admin
 
 # 6. Unpause and trigger the DAG
 #    UI → DAGs → sftp_sync → toggle ON → ▶ Trigger DAG
@@ -78,19 +79,31 @@ docker compose exec sftp-target cat /home/user/upload/a/b/c/file_1.txt
 
 ## Connecting to an external SFTP server
 
-Update the Airflow connections via the UI (**Admin → Connections**) or override them at startup by editing `docker-compose.yml` → `airflow-init`:
+Edit the SFTP variables in `.env`:
 
 ```bash
-airflow connections add sftp_source \
-  --conn-type sftp \
-  --conn-host your.sftp.host \
-  --conn-login your_user \
-  --conn-password your_password \
-  --conn-port 22 \
-  --conn-extra '{"root_path": "/data"}'
+# Source SFTP
+SFTP_SOURCE_HOST=your.sftp.host
+SFTP_SOURCE_USER=your_user
+SFTP_SOURCE_PASSWORD=your_password
+SFTP_SOURCE_PORT=22
+SFTP_SOURCE_ROOT=/data
+
+# Target SFTP
+SFTP_TARGET_HOST=your.target.host
+SFTP_TARGET_USER=your_user
+SFTP_TARGET_PASSWORD=your_password
+SFTP_TARGET_PORT=22
+SFTP_TARGET_ROOT=/data
 ```
 
-The DAG also accepts `source_conn_id`, `target_conn_id`, `source_root`, `target_root`, and `source_prefix` as run-time parameters (Trigger DAG → Conf).
+Then restart the init container to re-create the connections:
+
+```bash
+docker compose up -d --force-recreate airflow-init
+```
+
+Alternatively, update connections via the UI (**Admin → Connections**) or pass `source_conn_id`, `target_conn_id`, `source_root`, `target_root`, and `source_prefix` as run-time parameters (Trigger DAG → Conf).
 
 ---
 
@@ -107,6 +120,19 @@ docker compose exec airflow-scheduler \
 
 ---
 
+## Running tests
+
+```bash
+# Unit tests (no Airflow or Docker required)
+python -m unittest discover -s tests -v
+
+# DAG integrity tests (run inside the scheduler container)
+docker compose exec airflow-scheduler \
+  python -m unittest tests/test_dag_integrity.py -v
+```
+
+---
+
 ## Assumptions and design decisions
 
 | Topic | Decision | Rationale |
@@ -115,7 +141,7 @@ docker compose exec airflow-scheduler \
 | **Change detection** | File path used as the deduplication key | Simple and predictable; re-running after a manifest reset transfers everything again |
 | **Large files** | Paramiko `prefetch` + 8 MB chunk streaming | Files are never fully loaded into RAM; the chunk size is configurable per call |
 | **Concurrency** | `max_active_tis_per_dagrun=4`, `max_active_runs=1` | Limits SFTP connection pressure; prevents overlapping DAG runs from double-listing |
-| **Manifest race** | Each task writes a different path key → no true conflict | Worst case: a file is transferred twice (idempotent overwrite); acceptable trade-off for simplicity |
+| **Manifest update** | A dedicated `update_manifest` task merges all paths in one write | Eliminates the race condition of concurrent tasks each doing load-modify-save independently |
 | **Database** | PostgreSQL instead of SQLite | SQLite does not support concurrent writes required by the Celery result backend |
 | **Transform pipeline** | `TransformPipeline` chains `Transform` objects over the byte stream | Adding gzip/encryption requires a new `Transform` subclass — the DAG and sync logic are unchanged |
 | **Backend abstraction** | `StorageBackend` ABC with `list_files / read_chunks / write_chunks / exists` | Replacing SFTP with S3 requires only a new class; the DAG calls the same interface |
